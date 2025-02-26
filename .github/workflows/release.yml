@@ -1,0 +1,306 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+# Permissions required to create tags and releases
+permissions:
+  contents: write
+  packages: read
+
+jobs:
+  # Auto versioning when there are merges to main
+  version-check:
+    if: github.ref == 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.get_version.outputs.version }}
+      has_tag: ${{ steps.check_tag.outputs.has_tag }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get current version
+        id: get_version
+        run: |
+          VERSION=$(grep -m1 version Cargo.toml | cut -d '"' -f2)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag exists
+        id: check_tag
+        run: |
+          if git tag -l | grep -q "v${{ steps.get_version.outputs.version }}"; then
+            echo "has_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+  # Automatically create a tag on main when the version changes
+  create-tag:
+    needs: version-check
+    if: github.ref == 'refs/heads/main' && needs.version-check.outputs.has_tag == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push tag
+        run: |
+          VERSION=${{ needs.version-check.outputs.current_version }}
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "actions@github.com"
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "v$VERSION"
+
+  # Run tests and coverage on multiple platforms
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+        include:
+          - os: ubuntu-latest
+            clipboard: xclip wl-clipboard
+          - os: macos-latest
+            clipboard:
+          - os: windows-latest
+            clipboard:
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy, rustfmt
+          profile: minimal
+          override: true
+
+      - name: Install clipboard tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.clipboard }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check code formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Install tarpaulin (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install cargo-tarpaulin
+
+      - name: Generate coverage report (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo tarpaulin --out Xml
+
+      - name: Upload coverage to Codecov (Ubuntu only)
+        if: matrix.os == 'ubuntu-latest' && github.event_name != 'pull_request'
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./cobertura.xml
+          fail_ci_if_error: false
+
+  # Build and release only when there are tags
+  build:
+    name: Build Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_name: fcpy-linux-amd64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_name: fcpy-windows-amd64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_name: fcpy-macos-amd64
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          profile: minimal
+          override: true
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Rename binary (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          cp target/${{ matrix.target }}/release/fcpy ${{ matrix.asset_name }}
+
+      - name: Rename binary (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          cp target/${{ matrix.target }}/release/fcpy.exe ${{ matrix.asset_name }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: binaries
+          path: ${{ matrix.asset_name }}
+
+  # Create GitHub release with all artifacts
+  github-release:
+    name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: binaries
+          path: ./binaries
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./binaries/*
+          draft: false
+          prerelease: false
+          name: Release ${{ github.ref_name }}
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish to crates.io when there are tags
+  publish-crates:
+    name: Publish to crates.io
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          profile: minimal
+          override: true
+
+      - name: Publish to crates.io
+        uses: actions-rs/cargo@v1
+        with:
+          command: publish
+          args: --token ${{ secrets.CRATES_IO_TOKEN }}
+
+  # Publish to AUR when there are tags
+  publish-aur:
+    name: Publish to AUR
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          known_hosts: "aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN"
+          if_key_exists: replace
+
+      - name: Clone AUR package
+        run: git clone ssh://aur@aur.archlinux.org/fcpy.git aur
+
+      - name: Update PKGBUILD
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          cd aur
+          cat > PKGBUILD << EOF
+          # Maintainer: Thomas Almeida <hi@thomasalmeida.com>
+          pkgname=fcpy
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="Fast command-line file concatenator with smart filtering and clipboard integration"
+          arch=('x86_64')
+          url="https://github.com/thomasalmeida/fcpy"
+          license=('MIT')
+          depends=('gcc-libs')
+          optdepends=('wl-clipboard: clipboard support for Wayland'
+                      'xclip: clipboard support for X11')
+          makedepends=('cargo' 'git')
+          source=("\${pkgname}-\${pkgver}.tar.gz::https://github.com/thomasalmeida/fcpy/archive/v\${pkgver}.tar.gz")
+          sha256sums=('SKIP')
+
+          build() {
+            cd "\${pkgname}-\${pkgver}"
+            cargo build --release --locked
+          }
+
+          check() {
+            cd "\${pkgname}-\${pkgver}"
+            cargo test --release
+          }
+
+          package() {
+            cd "\${pkgname}-\${pkgver}"
+            install -Dm755 "target/release/\${pkgname}" "\${pkgdir}/usr/bin/\${pkgname}"
+            install -Dm644 LICENSE "\${pkgdir}/usr/share/licenses/\${pkgname}/LICENSE"
+            install -Dm644 README.md "\${pkgdir}/usr/share/doc/\${pkgname}/README.md"
+          }
+          EOF
+
+      - name: Update .SRCINFO
+        run: |
+          cd aur
+          docker run --rm -v "$PWD":/pkg -w /pkg archlinux:base bash -c "pacman -Syu --noconfirm base-devel && makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Commit and push AUR package
+        run: |
+          VERSION=${{ steps.get_version.outputs.VERSION }}
+          cd aur
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to version ${VERSION}"
+          git push
